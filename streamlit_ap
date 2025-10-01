@@ -1,0 +1,98 @@
+# Mini Trader (Lite) – one file deploy
+import streamlit as st, yfinance as yf, pandas as pd, numpy as np
+
+st.set_page_config(page_title="Mini Trader (Lite)", layout="wide")
+
+tickers_txt = st.sidebar.text_input("Tickers (comma separated)", value="AAPL, MSFT, NVDA")
+TICKERS = [t.strip().upper() for t in tickers_txt.replace(";",",").split(",") if t.strip()]
+START = st.sidebar.text_input("Start date (YYYY-MM-DD)", value="2018-01-01")
+EQUITY = st.sidebar.number_input("Account equity ($)", value=10000.0, step=100.0)
+PER_CAP = st.sidebar.slider("Per-symbol cap", 0.02, 0.5, 0.10, 0.01)
+GROSS_CAP = st.sidebar.slider("Gross cap", 0.5, 5.0, 1.0, 0.1)
+
+st.title("Mini Trader (Lite)")
+st.caption("News • Signals • Suggested trades (education only)")
+
+@st.cache_data(show_spinner=False)
+def fetch_prices(symbols, start):
+    if not symbols: return pd.DataFrame()
+    data = yf.download(symbols, start=start, progress=False, auto_adjust=False, group_by="column")
+    if isinstance(symbols, list) and len(symbols)==1:
+        adj = data["Adj Close"].to_frame(symbols[0]) if "Adj Close" in data else data["Close"].to_frame(symbols[0])
+    else:
+        try: adj = data["Adj Close"]
+        except Exception: adj = data["Close"]
+    adj = adj.dropna(how="all").sort_index()
+    if adj.empty: return adj
+    thresh = max(1, int(0.85*len(adj)))
+    return adj.dropna(axis=1, thresh=thresh).ffill().bfill().apply(pd.to_numeric, errors="coerce")
+
+def sma_signal(px, fast=50, slow=200):
+    sma_f = px.rolling(fast).mean(); sma_s = px.rolling(slow).mean()
+    sig = (sma_f > sma_s).astype(int)  # 1 long, 0 cash
+    return sig, pd.DataFrame({"Price":px, f"SMA{fast}":sma_f, f"SMA{slow}":sma_s})
+
+def cross_sec_mr(prices, lookback=20, top_frac=0.2, cap=0.05):
+    rets = prices.pct_change().fillna(0.0)
+    demean = rets.sub(rets.mean(axis=1), axis=0)
+    z = (demean - demean.rolling(20).mean())/(demean.rolling(20).std()+1e-8)
+    alpha = -z.shift(1).iloc[-1].dropna()
+    k = max(2, int(len(alpha)*top_frac))
+    s = alpha.abs().nlargest(k).index
+    w = alpha[s]
+    w = (w/w.abs().sum()) if w.abs().sum()>0 else w*0.0
+    w = w.clip(-cap, cap)
+    if w.abs().sum()>0: w = w/w.abs().sum()
+    return w
+
+def cap_weights(w, per_cap, gross_cap):
+    w = w.clip(-per_cap, per_cap)
+    g = w.abs().sum()
+    if g>gross_cap and g>0: w = w*(gross_cap/g)
+    return w
+
+def suggest_orders(last_px, weights, equity):
+    out=[]
+    for sym, wt in weights.items():
+        px = float(last_px.get(sym, np.nan))
+        if not np.isfinite(px): continue
+        dollars = wt*equity
+        qty = int(np.floor(abs(dollars)/px))
+        if qty<=0: continue
+        side = "buy" if dollars>0 else "sell"
+        out.append(dict(symbol=sym, side=side, qty=qty, price=round(px,2), weight=round(wt,4)))
+    return pd.DataFrame(out).sort_values(["side","symbol"]).reset_index(drop=True)
+
+# --- News ---
+st.subheader("News (Yahoo Finance)")
+for tk in TICKERS[:8]:
+    try:
+        n = yf.Ticker(tk).news or []
+        st.markdown(f"**{tk}**")
+        for item in n[:5]:
+            st.write(f"• [{item.get('title','news')}]({item.get('link','')})  ({item.get('publisher','')})")
+    except Exception as e:
+        st.caption(f"{tk}: news unavailable ({e})")
+
+st.markdown("---")
+
+# --- Signals & Trades ---
+st.subheader("Signals & Suggested Trades")
+prices = fetch_prices(TICKERS, START)
+if prices.empty:
+    st.info("No price data yet.")
+else:
+    last = prices.iloc[-1].astype(float)
+    if len(prices.columns)==1:
+        sym = prices.columns[0]; px = prices[sym].dropna()
+        sig, aux = sma_signal(px)
+        state = "LONG" if sig.iloc[-1]>0 else "CASH"
+        st.write(f"**{sym}** : {state}  •  Last ${px.iloc[-1]:.2f}")
+        st.line_chart(aux)
+        weights = pd.Series({sym: 0.10 if state=="LONG" else 0.0})
+    else:
+        weights = cross_sec_mr(prices, cap=PER_CAP); st.dataframe(weights.rename("weight"))
+    weights = cap_weights(weights, PER_CAP, GROSS_CAP)
+    orders = suggest_orders(last, weights, EQUITY)
+    st.write("**Suggested orders**")
+    st.dataframe(orders) if not orders.empty else st.info("No orders today.")
